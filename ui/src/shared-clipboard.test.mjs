@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { clipboardReconnectDelay, copyGuestText, shareClipboard } from "./shared-clipboard.mjs";
+import { clipboardBusyRetryDelay, clipboardReconnectDelay, clipboardSyncRounds, copyGuestText, shareClipboard } from "./shared-clipboard.mjs";
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
@@ -476,5 +476,82 @@ test("external clipboard revision bumps with identical content or native unchang
     f.host({ unchanged: true });
     await f.controller.poll();
     assert.equal(f.sent.length, 1, "native unchanged marker must not send or fail");
+  } finally { f.controller.dispose(); }
+});
+
+// A host clipboard that another application holds open for a moment.
+function busyFixture({ busyReads = 0, content = { text: "host copy" }, churn = false } = {}) {
+  const sent = [], active = [];
+  let revision = 1, reads = 0, closed = 0, busyLeft = busyReads;
+  const socket = { readyState: 1, send: text => {
+    const value = JSON.parse(text);
+    sent.push(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "serial")));
+    queueMicrotask(() => socket.onmessage({ data: JSON.stringify({ ack: value.serial }) }));
+  }, close() { closed++; this.readyState = 3; this.onclose?.(); } };
+  const controller = shareClipboard({
+    connect: () => socket, interval: 60000, onStatus: () => {}, setActive: value => active.push(value),
+    schedule: () => 0,
+    native: async action => {
+      // A clipboard that keeps changing reports a newer revision every time.
+      if (action === "clipboardRevision") return churn ? ++revision : revision;
+      if (action === "clipboardSyncRead") {
+        reads++;
+        if (busyLeft === Infinity || busyLeft-- > 0) return { revision, busy: true };
+        return { ...content, revision };
+      }
+    },
+  });
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ hello: { version: 1, os: "windows", session: "busy-session", formats: ["text", "png", "files"], available: true } }) });
+  return { controller, sent, active, reads: () => reads, closed: () => closed,
+    host: value => { content = value; revision++; }, busyNext: count => { busyLeft = count; } };
+}
+
+test("a busy host clipboard is read again shortly instead of being sent empty or dropping the guest", async () => {
+  const f = busyFixture({ busyReads: 3 });
+  try {
+    await settle();
+    assert.deepEqual(f.sent, [], "a locked clipboard is not guessed as empty text");
+    await new Promise(resolve => setTimeout(resolve, clipboardBusyRetryDelay * 6));
+    assert.deepEqual(f.sent, [{ text: "host copy" }]);
+    assert.equal(f.reads(), 4);
+    assert.equal(f.closed(), 0, "the guest connection stays up");
+    assert.notEqual(f.active.at(-1), false);
+  } finally { f.controller.dispose(); }
+});
+
+test("an explicit paste waits through a busy host clipboard and delivers the copy", async () => {
+  const f = busyFixture();
+  try {
+    await settle();
+    assert.deepEqual(f.sent, [{ text: "host copy" }]);
+    f.host({ text: "copied just before paste" });
+    f.busyNext(2);
+    const reads = f.reads();
+    await f.controller.sync();
+    assert.deepEqual(f.sent, [{ text: "host copy" }, { text: "copied just before paste" }]);
+    assert.equal(f.reads(), reads + 3);
+    assert.equal(f.closed(), 0);
+  } finally { f.controller.dispose(); }
+});
+
+test("an explicit paste gives up on a host clipboard that stays busy", async () => {
+  const f = busyFixture({ busyReads: Infinity });
+  try {
+    await settle();
+    const started = Date.now();
+    await assert.rejects(f.controller.sync(), /占用或持续变化/);
+    assert.ok(Date.now() - started >= clipboardBusyRetryDelay * (clipboardSyncRounds - 1));
+    assert.deepEqual(f.sent, [], "a locked clipboard is never sent as empty text");
+    assert.equal(f.closed(), 0);
+  } finally { f.controller.dispose(); }
+});
+
+test("an explicit paste gives up on a host clipboard that never stops changing", async () => {
+  const f = busyFixture({ churn: true });
+  try {
+    await settle();
+    await assert.rejects(f.controller.sync(), /占用或持续变化/);
+    assert.equal(f.closed(), 0);
   } finally { f.controller.dispose(); }
 });

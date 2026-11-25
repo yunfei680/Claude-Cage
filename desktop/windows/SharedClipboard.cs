@@ -60,6 +60,92 @@ internal static class SharedClipboard
     }
     [DllImport("user32.dll")]
     private static extern uint GetClipboardSequenceNumber();
+
+    // Synchronization reads the clipboard through Win32 instead of the WinForms
+    // Clipboard class. Each WinForms call opens the OLE clipboard again and,
+    // when another application holds it, sleeps 100 ms on the UI thread up to
+    // ten times; a read that still fails comes back as empty text. Clipboard
+    // managers, input methods and chat apps open the clipboard after every
+    // copy, so polling met that often: the window froze, and the guest
+    // received an empty clipboard that the next paste inserted as nothing.
+    // Format checks below do not open the clipboard. The data read opens it
+    // once, retries without blocking the window, and reports a held clipboard
+    // as busy so the workbench reads it again instead of guessing.
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool CloseClipboard();
+    [DllImport("user32.dll")] private static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")] private static extern IntPtr GetClipboardData(uint format);
+    [DllImport("user32.dll", EntryPoint = "RegisterClipboardFormatW", CharSet = CharSet.Unicode)] private static extern uint RegisterClipboardFormat(string name);
+    [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("kernel32.dll")] private static extern UIntPtr GlobalSize(IntPtr memory);
+    [DllImport("shell32.dll", EntryPoint = "DragQueryFileW", CharSet = CharSet.Unicode)] private static extern uint DragQueryFile(IntPtr drop, uint index, [Out] char[]? path, uint length);
+    private const uint BitmapFormat = 2, DibFormat = 8, UnicodeTextFormat = 13, FileDropFormat = 15, DibV5Format = 17;
+    private static readonly uint RichTextFormat = RegisterClipboardFormat(DataFormats.Rtf);
+
+    private sealed class ClipboardBusyException : Exception { }
+
+    private static bool HasImage() =>
+        IsClipboardFormatAvailable(BitmapFormat) || IsClipboardFormatAvailable(DibFormat) || IsClipboardFormatAvailable(DibV5Format);
+
+    // Never hold the clipboard across an await: other applications wait for it.
+    private static async Task<T> ReadOpen<T>(Func<T?> read, CancellationToken token) where T : class
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            if (OpenClipboard(IntPtr.Zero))
+            {
+                T? value;
+                try { value = read(); }
+                finally { CloseClipboard(); }
+                // A listed format without data was replaced or failed to render.
+                return value ?? throw new ClipboardBusyException();
+            }
+            if (attempt == 6) throw new ClipboardBusyException();
+            await Task.Delay(attempt < 3 ? 5 : 20, token);
+        }
+    }
+
+    private static string? OpenText()
+    {
+        var memory = GetClipboardData(UnicodeTextFormat);
+        if (memory == IntPtr.Zero) return null;
+        var pointer = GlobalLock(memory);
+        if (pointer == IntPtr.Zero) return null;
+        try
+        {
+            var text = Marshal.PtrToStringUni(pointer, (int)Math.Min((ulong)GlobalSize(memory) / 2, int.MaxValue));
+            var end = text.IndexOf('\0');
+            return end < 0 ? text : text[..end];
+        }
+        finally { GlobalUnlock(memory); }
+    }
+
+    private static string[]? OpenFiles()
+    {
+        var drop = GetClipboardData(FileDropFormat);
+        if (drop == IntPtr.Zero) return null;
+        var paths = new string[DragQueryFile(drop, uint.MaxValue, null, 0)];
+        for (uint index = 0; index < paths.Length; index++)
+        {
+            var length = DragQueryFile(drop, index, null, 0);
+            var path = new char[length + 1];
+            if (DragQueryFile(drop, index, path, length + 1) != length) return null;
+            paths[index] = new string(path, 0, (int)length);
+        }
+        return paths;
+    }
+
+    // The same conversion WinForms applies to a copied picture. The clipboard
+    // keeps its bitmap; FromHbitmap copies the pixels.
+    private static Bitmap? OpenImage()
+    {
+        var bitmap = GetClipboardData(BitmapFormat);
+        return bitmap == IntPtr.Zero ? null : Image.FromHbitmap(bitmap);
+    }
+
+    private static async Task<string[]> SelectedFiles(CancellationToken token) =>
+        IsClipboardFormatAvailable(FileDropFormat) ? await ReadOpen(OpenFiles, token) : [];
     public static uint Revision
     {
         get
@@ -109,9 +195,11 @@ internal static class SharedClipboard
                     copies.TryAdd(item.Text("cache_id"), item.GetProperty("paths").EnumerateArray().Select(path => path.GetString()!).ToArray());
                 loaded = true;
             }
+            if (copies.Count == 0) return;
+            // Read the selection once per check; a busy clipboard retains its files.
+            var selected = await SelectedFiles(CancellationToken.None);
             foreach (var copy in copies.ToArray())
             {
-                var selected = Clipboard.ContainsFileDropList() ? Clipboard.GetFileDropList().Cast<string>().ToArray() : [];
                 if (pending.Contains(copy.Key) || References(selected, copy.Value) || readers.Any(paths => References(paths, copy.Value))) continue;
                 await ReleaseLocal(copy.Key);
             }
@@ -153,11 +241,17 @@ internal static class SharedClipboard
     public static async Task<object> Read(JsonElement request, CancellationToken token)
     {
         var revision = Revision;
+        try { return await ReadSnapshot(request, revision, token); }
+        catch (ClipboardBusyException) { return new { revision, busy = true }; }
+    }
+
+    private static async Task<object> ReadSnapshot(JsonElement request, uint revision, CancellationToken token)
+    {
         var capturedGeneration = generation;
-        if (Clipboard.ContainsFileDropList())
+        if (IsClipboardFormatAvailable(FileDropFormat))
         {
+            var selected = await ReadOpen(OpenFiles, token);
             lastImageDigest = null;
-            var selected = Clipboard.GetFileDropList().Cast<string>().ToArray();
             if (request.TryGetProperty("defer_files", out var defer) && defer.ValueKind == JsonValueKind.True)
                 return new { revision, files_pending = true, count = selected.Length };
             using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, sends.Token);
@@ -179,29 +273,38 @@ internal static class SharedClipboard
             catch (OperationCanceledException) { throw new IOException("剪贴板文件传递已取消"); }
             finally { readers.Remove(selected); await Collect(); }
         }
-        if (RichText() is { } copied)
+        // Same rule as RichText(): rich text with a rendered picture is text.
+        if (IsClipboardFormatAvailable(UnicodeTextFormat) && IsClipboardFormatAvailable(RichTextFormat) &&
+            await ReadOpen(OpenText, token) is { Length: > 0 } copied)
         {
             lastImageDigest = null;
             return new { revision, text = copied };
         }
-        if (Clipboard.ContainsImage())
+        if (HasImage())
         {
-            using var image = Clipboard.GetImage() ?? throw new IOException("无法读取剪贴板图片");
+            using var image = await ReadOpen(OpenImage, token);
             if ((long)image.Width * image.Height > 40_000_000) throw new IOException("图片不能超过 4000 万像素");
             var initial = request.TryGetProperty("initial", out var initProp) && initProp.ValueKind == JsonValueKind.True;
-            var digest = ComputeImageDigest(image);
-            if (!initial && digest == lastImageDigest)
+            var previous = lastImageDigest;
+            // Hashing and PNG-encoding a screenshot takes long enough to freeze
+            // the window, and the clipboard is already closed: encode elsewhere.
+            var (digest, png) = await Task.Run(() =>
             {
-                return new { revision, unchanged = true };
-            }
-            using var output = new MemoryStream();
-            image.Save(output, System.Drawing.Imaging.ImageFormat.Png);
-            if (output.Length > 20 * 1024 * 1024) throw new IOException("图片不能超过 20 MB");
+                var hash = ComputeImageDigest(image);
+                if (!initial && hash == previous) return (hash, (byte[]?)null);
+                using var output = new MemoryStream();
+                image.Save(output, System.Drawing.Imaging.ImageFormat.Png);
+                return (hash, output.Length > 20 * 1024 * 1024 ? Array.Empty<byte>() : output.ToArray());
+            }, token);
+            if (png == null) return new { revision, unchanged = true };
+            if (png.Length == 0) throw new IOException("图片不能超过 20 MB");
             lastImageDigest = digest;
-            return new { revision, png = Convert.ToBase64String(output.ToArray()) };
+            return new { revision, png = Convert.ToBase64String(png) };
         }
         lastImageDigest = null;
-        return new { revision, text = Clipboard.ContainsText() ? Clipboard.GetText() : "" };
+        // An empty clipboard and one holding only other formats share as
+        // empty text. A text copy that cannot be read now is busy, not empty.
+        return new { revision, text = IsClipboardFormatAvailable(UnicodeTextFormat) ? await ReadOpen(OpenText, token) : "" };
     }
 
     public static async Task<object> Write(JsonElement request, CancellationToken token)

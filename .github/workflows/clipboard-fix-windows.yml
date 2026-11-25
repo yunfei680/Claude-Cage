@@ -1,0 +1,17 @@
+name: Clipboard fix Windows installer
+# Builds only the unsigned Windows installer for this branch with the
+# repository's own Windows build workflow. No signing secrets are used.
+on:
+  push:
+    branches: [clipboard-fix]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      ref: ${{ github.sha }}
+      release: false
+      artifact_name: cage-windows-clipboard-fix
+      all_windows_versions: false

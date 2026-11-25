@@ -1119,3 +1119,76 @@ test('remote hover shape updates even without an editable focus and rejects arbi
     }
   });
 }
+
+{
+  // Paste probes are the caret checks readAndPaste makes itself; the caret
+  // poll passes its composition session, so it is not counted.
+  const pasteFixture = ({ sync = async () => {}, carets = [] } = {}) => {
+    const probes = [];
+    const f = fixture(true, false, {
+      clipboardActive: () => true,
+      syncClipboard: sync,
+      caretRect: async session => {
+        if (session !== undefined) return { available: true, context: "a".repeat(32), rect: [10, 20, 0, 24] };
+        probes.push(session);
+        return carets.shift() ?? { available: false };
+      },
+    });
+    const pasted = () => f.keys.some(([, code, down]) => code === "KeyV" && down);
+    return { f, probes, pasted };
+  };
+  const slowSync = () => new Promise(resolve => setTimeout(resolve, 200));
+  const field = (context, rect = [10, 20, 0, 24]) => ({ available: true, context: context.repeat(32), rect });
+
+  test("an already synchronized shared clipboard pastes at once without caret probes", async () => {
+    const { f, probes, pasted } = pasteFixture();
+    try {
+      await f.controller.readAndPaste();
+      assert.deepEqual(probes, []);
+      assert.ok(pasted());
+      assert.equal(f.statuses.at(-1), "已粘贴");
+    } finally { f.controller.dispose(); }
+  });
+
+  test("a slow shared clipboard sync still refuses a paste whose focus moved to another field", async () => {
+    const { f, probes, pasted } = pasteFixture({ sync: slowSync, carets: [field("a"), field("b", [300, 400, 0, 24])] });
+    try {
+      await f.controller.readAndPaste();
+      assert.equal(probes.length, 2);
+      assert.equal(pasted(), false);
+      assert.equal(f.statuses.at(-1), "粘贴位置已切换，请回到原输入位置重试");
+    } finally { f.controller.dispose(); }
+  });
+
+  test("a slow shared clipboard sync pastes when the field only reset its input context", async () => {
+    const { f, pasted } = pasteFixture({ sync: slowSync, carets: [field("a"), field("b")] });
+    try {
+      await f.controller.readAndPaste();
+      assert.ok(pasted());
+      assert.equal(f.statuses.at(-1), "已粘贴");
+    } finally { f.controller.dispose(); }
+  });
+
+  test("a slow shared clipboard sync tolerates one caret probe missed by a busy application", async () => {
+    const once = pasteFixture({ sync: slowSync, carets: [field("a"), { available: false }, field("a")] });
+    try {
+      await once.f.controller.readAndPaste();
+      assert.equal(once.probes.length, 3);
+      assert.ok(once.pasted());
+    } finally { once.f.controller.dispose(); }
+    const twice = pasteFixture({ sync: slowSync, carets: [field("a"), { available: false }, { available: false }] });
+    try {
+      await twice.f.controller.readAndPaste();
+      assert.equal(twice.pasted(), false, "a field that stays unavailable is treated as a focus change");
+    } finally { twice.f.controller.dispose(); }
+  });
+
+  test("a failed shared clipboard sync never sends the paste keys", async () => {
+    const { f, pasted } = pasteFixture({ sync: async () => { throw new Error("本机剪贴板正被其他程序占用或持续变化，请稍后重新粘贴。"); } });
+    try {
+      await f.controller.readAndPaste();
+      assert.equal(pasted(), false);
+      assert.equal(f.statuses.at(-1), "本机剪贴板正被其他程序占用或持续变化，请稍后重新粘贴。");
+    } finally { f.controller.dispose(); }
+  });
+}

@@ -9,6 +9,17 @@ import {
   imagePayload,
 } from "./image-transfer";
 
+// A shared clipboard sync that settles within this time leaves no room to
+// move focus, so the paste skips the caret checks around it.
+const pasteSyncQuick = 150;
+
+// Applications reset their input method context while re-rendering a field;
+// the caret stays where it was. Focus in another place moves or clears it.
+const sameCaretTarget = (before, after) => Boolean(after?.available) &&
+  (after.context === before.context ||
+    (Array.isArray(before.rect) && Array.isArray(after.rect) && before.rect.length === after.rect.length &&
+      before.rect.every((value, index) => value === after.rect[index])));
+
 // A user gesture starts every host clipboard access. Fences and serialization
 // in the shared RFB patch ensure that repeated pastes are processed in order.
 export function installRemoteInput(
@@ -540,11 +551,25 @@ export function installRemoteInput(
       const id = getTargetId();
       say("正在粘贴…");
       return transport.runKeyAction(async sendKey => {
-        const before = await caretRect?.();
-        await syncClipboard();
-        const after = await caretRect?.();
-        if (disposed || !isActive() || id !== getTargetId() ||
-            (before?.available && (!after?.available || before.context !== after.context))) {
+        // Usually background polling has already delivered the host copy, so
+        // the sync settles at once and there is no time to move focus: paste
+        // without probing the caret twice (each probe is a guest round trip).
+        const synced = syncClipboard();
+        const quick = await Promise.race([
+          synced.then(() => true),
+          new Promise(resolve => setTimeout(() => resolve(false), pasteSyncQuick)),
+        ]);
+        if (!quick) {
+          const before = await caretRect?.();
+          await synced;
+          let after = before?.available ? await caretRect?.() : undefined;
+          // A busy application can miss one probe without losing focus.
+          if (before?.available && !after?.available) after = await caretRect?.();
+          if (before?.available && !sameCaretTarget(before, after)) {
+            throw new Error("粘贴位置已切换，请回到原输入位置重试");
+          }
+        }
+        if (disposed || !isActive() || id !== getTargetId()) {
           throw new Error("粘贴位置已切换，请回到原输入位置重试");
         }
         for (const key of shortcutKeys("v")) await sendKey(...key);
