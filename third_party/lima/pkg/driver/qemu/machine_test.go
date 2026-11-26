@@ -6,14 +6,21 @@ package qemu
 import "testing"
 
 func TestWHPXMachineCompatibility(t *testing.T) {
-	for _, accel := range []string{"whpx", "kvm", "hvf", "nvmm"} {
-		want := "q35,accel=" + accel
-		if accel == "whpx" {
-			want += ",kernel-irqchip=off"
+	for _, emulated := range []bool{false, true} {
+		if emulated {
+			t.Setenv(whpxEmulatedIRQChip, "off")
+		} else {
+			t.Setenv(whpxEmulatedIRQChip, "")
 		}
-		args := appendQ35Machine(nil, accel)
-		if got, _ := argValue(args, "-machine"); got != want {
-			t.Fatalf("%s: got %q, want %q", accel, got, want)
+		for _, accel := range []string{"whpx", "kvm", "hvf", "nvmm"} {
+			want := "q35,accel=" + accel
+			if accel == "whpx" && emulated {
+				want += ",kernel-irqchip=off"
+			}
+			args := appendQ35Machine(nil, accel)
+			if got, _ := argValue(args, "-machine"); got != want {
+				t.Fatalf("%s (emulated irqchip %v): got %q, want %q", accel, emulated, got, want)
+			}
 		}
 	}
 	// Retain Lima's explicit override contract for custom QEMU arguments.

@@ -1,0 +1,26 @@
+Windows can report nested virtualization support for WHPX and still refuse
+to enable it (hr=80370302). QEMU then stopped the VM, so Cage turned the
+in-hypervisor local APIC off for every host, which made guest timers and
+inter-processor interrupts slow. Continue without nested virtualization.
+
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -3198,10 +3198,14 @@
+             WHvPartitionPropertyCodeNestedVirtualization,
+             &prop,
+             sizeof(WHV_PARTITION_PROPERTY));
+-            if (FAILED(hr)) {
+-                error_report("WHPX: Failed to enable nested virtualization, hr=%08lx", hr);
+-                ret = -EINVAL;
+-                goto error;
++        /*
++         * Windows can report nested virtualization support and still refuse
++         * to enable it (hr=80370302). A guest that runs no hypervisor of its
++         * own needs neither: keep the in-hypervisor local APIC and continue.
++         */
++        if (FAILED(hr)) {
++            warn_report("WHPX: Failed to enable nested virtualization, hr=%08lx; "
++                        "continuing without it", hr);
+         }
+     }
+ 

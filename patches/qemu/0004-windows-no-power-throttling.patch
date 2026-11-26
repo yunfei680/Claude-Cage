@@ -1,0 +1,53 @@
+Opt QEMU out of Windows power throttling, which can slow its vCPU threads
+and ignore its timer resolution request while it runs without a window.
+
+--- a/os-win32.c
++++ b/os-win32.c
+@@ -47,9 +47,47 @@
+     timeEndPeriod(mm_tc.wPeriodMin);
+ }
+ 
++/*
++ * QEMU often runs without a window, as a background process. Windows may then
++ * run it with reduced execution speed (EcoQoS, efficiency cores) and ignore
++ * its timer resolution request, so that guest timers emulated here wait for
++ * the 15.6 ms system tick. A virtual machine's guest is the user's foreground
++ * work: opt out of both. Windows 10 does not know the timer flag.
++ */
++static void os_disable_power_throttling(void)
++{
++    typedef struct {
++        ULONG Version;
++        ULONG ControlMask;
++        ULONG StateMask;
++    } PowerThrottlingState;
++    typedef BOOL (WINAPI *SetProcessInformationFunc)(HANDLE, int, LPVOID, DWORD);
++    const int process_power_throttling = 4;
++    const ULONG execution_speed = 0x1, ignore_timer_resolution = 0x4;
++    SetProcessInformationFunc set_information = (SetProcessInformationFunc)
++        (void (*)(void))GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
++                                       "SetProcessInformation");
++    PowerThrottlingState state = {
++        .Version = 1,
++        .ControlMask = execution_speed | ignore_timer_resolution,
++        .StateMask = 0,
++    };
++
++    if (!set_information) {
++        return;
++    }
++    if (!set_information(GetCurrentProcess(), process_power_throttling,
++                         &state, sizeof(state))) {
++        state.ControlMask = execution_speed;
++        set_information(GetCurrentProcess(), process_power_throttling,
++                        &state, sizeof(state));
++    }
++}
++
+ void os_setup_early_signal_handling(void)
+ {
+     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
++    os_disable_power_throttling();
+     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
+     timeBeginPeriod(mm_tc.wPeriodMin);
+     atexit(os_undo_timer_resolution);

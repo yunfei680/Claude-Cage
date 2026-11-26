@@ -4,13 +4,24 @@
 package qemu
 
 import (
+	"os"
+	"strings"
 	"unsafe"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
 
+// whpxCPUModel names the setting that replaces the qemu64 fallback, for
+// example CAGE_WHPX_CPU=host to pass AVX/AVX2, AES-NI and the other host
+// features to the guest with QEMU 11.1.0. That QEMU release mishandles host
+// passthrough when Windows itself runs nested (on Intel), so it is opt-in.
+const whpxCPUModel = "CAGE_WHPX_CPU"
+
 func whpxQEMU64() string {
+	if model := strings.TrimSpace(os.Getenv(whpxCPUModel)); model != "" {
+		return model
+	}
 	// Query the processor features available to Windows Hypervisor Platform
 	// guests. A nested hypervisor may expose a subset of the host's CPUID.
 	query := windows.NewLazySystemDLL("WinHvPlatform.dll").NewProc("WHvGetCapability")

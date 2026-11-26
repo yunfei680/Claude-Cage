@@ -1,7 +1,8 @@
 Subject: [PATCH] Expose WHPX-supported SSE features in the Windows qemu64 fallback
 
 Keep the explicit CPU model and newer QEMU host passthrough. On Windows
-x64, use WHvGetCapability to select additional qemu64 features.
+x64, use WHvGetCapability to select additional qemu64 features, unless
+CAGE_WHPX_CPU names a model (for example host) to use instead.
 
 diff --git a/pkg/driver/qemu/cpu_other.go b/pkg/driver/qemu/cpu_other.go
 new file mode 100644
@@ -23,20 +24,31 @@ new file mode 100644
 index 0000000..77bdb8c
 --- /dev/null
 +++ b/pkg/driver/qemu/cpu_windows_amd64.go
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,61 @@
 +// SPDX-FileCopyrightText: Copyright The Lima Authors
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package qemu
 +
 +import (
++	"os"
++	"strings"
 +	"unsafe"
 +
 +	"github.com/sirupsen/logrus"
 +	"golang.org/x/sys/windows"
 +)
 +
++// whpxCPUModel names the setting that replaces the qemu64 fallback, for
++// example CAGE_WHPX_CPU=host to pass AVX/AVX2, AES-NI and the other host
++// features to the guest with QEMU 11.1.0. That QEMU release mishandles host
++// passthrough when Windows itself runs nested (on Intel), so it is opt-in.
++const whpxCPUModel = "CAGE_WHPX_CPU"
++
 +func whpxQEMU64() string {
++	if model := strings.TrimSpace(os.Getenv(whpxCPUModel)); model != "" {
++		return model
++	}
 +	// Query the processor features available to Windows Hypervisor Platform
 +	// guests. A nested hypervisor may expose a subset of the host's CPUID.
 +	query := windows.NewLazySystemDLL("WinHvPlatform.dll").NewProc("WHvGetCapability")
