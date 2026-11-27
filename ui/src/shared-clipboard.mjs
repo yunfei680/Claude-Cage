@@ -14,6 +14,14 @@ export async function copyGuestText({ request, sendCopy, valid }) {
 // components wait for an update, must not be hit every 1.5 seconds.
 export const clipboardReconnectDelay = failures => Math.min(1500 * 2 ** Math.max(0, failures), 30000);
 
+// Clipboard managers, input methods and chat apps open the host clipboard to
+// read every copy. The native side reports that as busy instead of guessing:
+// read again shortly, without reconnecting the guest.
+export const clipboardBusyRetryDelay = 40;
+// An explicit paste rereads a clipboard that keeps changing or stays busy,
+// but must not wait for it forever.
+export const clipboardSyncRounds = 50;
+
 // One connection owns clipboard synchronization for the workbench window,
 // including while its remote canvas is hidden or the window is unfocused.
 export function shareClipboard({ connect, native, onStatus, setActive, interval = 300, schedule = setTimeout, isVisible = () => true }) {
@@ -23,8 +31,13 @@ export function shareClipboard({ connect, native, onStatus, setActive, interval 
   // A host copy that was read but never reached the guest. The native side
   // may already count it as seen, so the next read asks for it in full.
   let undelivered = false;
-  let sessionGeneration = 0, deferredFiles;
+  let sessionGeneration = 0, deferredFiles, busyTimer;
   let sessionController = new AbortController();
+  const cancelBusyRetry = () => { if (busyTimer !== undefined) { clearTimeout(busyTimer); busyTimer = undefined; } };
+  const retryBusy = initial => {
+    if (disposed || busyTimer !== undefined) return;
+    busyTimer = setTimeout(() => { busyTimer = undefined; void poll(initial).catch(warn); }, clipboardBusyRetryDelay);
+  };
   const acknowledgements = new Map();
   const fileReferences = new Map();
   const retainFiles = value => {
@@ -43,7 +56,7 @@ export function shareClipboard({ connect, native, onStatus, setActive, interval 
     generation++; sessionGeneration++;
     sessionController.abort(); sessionController = new AbortController();
     guestReady = false; revision = undefined; acknowledgedRevision = undefined; deferredFiles = undefined; lastPayload = "";
-    polling = undefined; writes = Promise.resolve();
+    polling = undefined; writes = Promise.resolve(); cancelBusyRetry();
     for (const pending of acknowledgements.values()) pending.reject();
     acknowledgements.clear();
     setActive(false);
@@ -81,6 +94,14 @@ export function shareClipboard({ connect, native, onStatus, setActive, interval 
       if (!initial && current === revision && (current === acknowledgedRevision || !explicit && current === deferredFiles)) return;
       const whole = initial || undelivered;
       const value = await native("clipboardSyncRead", explicit ? (whole ? { initial: true } : {}) : (whole ? { defer_files: true, initial: true } : { defer_files: true }));
+      if (value?.busy === true) {
+        // The copy is not empty, it is only locked for a moment. Sending an
+        // empty guess would make the next paste insert nothing.
+        if (disposed || socket !== currentSocket || currentGeneration !== generation) return;
+        undelivered = true;
+        if (!explicit) retryBusy(initial);
+        return "busy";
+      }
       releaseFiles = retainFiles(value);
       const deferred = value?.files_pending === true;
       if (deferred && explicit) throw new Error("Clipboard files were not read");
@@ -210,8 +231,13 @@ export function shareClipboard({ connect, native, onStatus, setActive, interval 
   }, async sync() {
     const signal = sessionController.signal;
     requireSession(signal);
-    for (;;) {
-      await waitForSession(poll(false, true), signal);
+    for (let round = 0; ; round++) {
+      if (round >= clipboardSyncRounds) throw new Error("本机剪贴板正被其他程序占用或持续变化，请稍后重新粘贴。");
+      const result = await waitForSession(poll(false, true), signal);
+      if (result === "busy") {
+        await waitForSession(new Promise(resolve => setTimeout(resolve, clipboardBusyRetryDelay)), signal);
+        continue;
+      }
       const pendingWrites = writes;
       await waitForSession(pendingWrites, signal);
       const sequence = generation;
@@ -221,7 +247,7 @@ export function shareClipboard({ connect, native, onStatus, setActive, interval 
       if (current === acknowledgedRevision && sequence === generation && pendingWrites === writes) return;
     }
   }, dispose() {
-    disposed = true; invalidateSession(); stopTimer(); clearTimeout(retry);
+    disposed = true; invalidateSession(); stopTimer(); clearTimeout(retry); cancelBusyRetry();
     socket?.close();
   } };
 }
