@@ -598,7 +598,7 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 			args = append(args, "-global", "ICH9-LPC.disable_s3=1")
 			args = append(args, "-global", "ICH9-LPC.disable_s4=1")
 		default:
-			args = appendQ35Machine(args, accel)
+			args = appendQ35Machine(args, accel, cfg.InstanceDir)
 		}
 	case limatype.AARCH64:
 		machine := "virt,accel=" + accel

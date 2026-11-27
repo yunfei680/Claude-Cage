@@ -469,7 +469,7 @@ func CommonOpts(ctx context.Context, sshExe SSHExe, useDotSSH bool) ([]string, e
 		// (OpenSSH_8.1p1, macOS 11.6, MacBookPro 2020, Core i7-1068NG7)
 		//
 		// We prioritize AES algorithms when AES accelerator is available.
-		if sshInfo.aesAccelerated {
+		if preferAESCiphers(sshInfo.aesAccelerated, runtime.GOOS) {
 			logrus.Debugf("AES accelerator seems available, prioritizing aes128-gcm@openssh.com and aes256-gcm@openssh.com")
 			if runtime.GOOS == "windows" {
 				opts = append(opts, "Ciphers=^aes128-gcm@openssh.com,aes256-gcm@openssh.com")
@@ -731,6 +731,15 @@ func detectValidPublicKey(content string) bool {
 	}
 	sigFormat := string(decodedKey[4 : 4+sigLength])
 	return algo == sigFormat
+}
+
+// preferAESCiphers reports whether AES-GCM goes ahead of chacha20-poly1305.
+// The guest decrypts every byte too. Cage's Windows guests run on WHPX with a
+// qemu64-based CPU model that has no AES-NI, where AES-GCM measured about a
+// quarter of chacha20-poly1305's speed (0.36 vs 1.32 GB/s), so the host's
+// accelerator alone does not decide there.
+func preferAESCiphers(hostAESAccelerated bool, goos string) bool {
+	return hostAESAccelerated && goos != "windows"
 }
 
 func detectAESAcceleration() bool {
