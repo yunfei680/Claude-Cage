@@ -1,0 +1,16 @@
+name: Proposal Windows build
+# Fork-only: builds and tests the unsigned Windows installer for a proposal
+# branch. Not part of the proposed change.
+on:
+  push:
+    branches: ['ci/**']
+permissions:
+  contents: read
+jobs:
+  windows:
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      ref: ${{ github.sha }}
+      release: false
+      artifact_name: cage-windows-proposal
+      all_windows_versions: false
