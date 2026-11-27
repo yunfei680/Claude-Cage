@@ -54,6 +54,9 @@ exit 0
 				os.WriteFile(filepath.Join(dir, name), []byte(body), 0755)
 			}
 			script := strings.ReplaceAll(DebianMirrorsScript, "/etc/apt/mirrors", mirrors)
+			script = strings.ReplaceAll(script, "/etc/apt/sources.list.d", filepath.Join(dir, "sources.list.d"))
+			script = strings.ReplaceAll(script, "/etc/apt/apt.conf.d", filepath.Join(dir, "apt.conf.d"))
+			script = strings.ReplaceAll(script, "/etc/claude-cage/debian-binary-only", filepath.Join(dir, "binary-only"))
 			script = strings.ReplaceAll(script, "/etc/claude-cage/debian-mirror", preference)
 			script = strings.ReplaceAll(script, "/usr/lib/apt/apt-helper", filepath.Join(dir, "apt-helper"))
 			suite := "trixie"
@@ -163,5 +166,80 @@ func TestDebianPrepareScriptKeepsChoiceOutOfEnvironment(t *testing.T) {
 	script := DebianPrepareScriptFor("ustc")
 	if !strings.Contains(script, "\ndebian_mirror_choice=ustc\n") || strings.Contains(script, "export debian_mirror_choice") || strings.Contains(script, DebianMirrorEnv+"=") {
 		t.Fatalf("choice not passed as a plain shell variable: %q", script)
+	}
+}
+
+func TestDebianSourcesSkipSourceIndexesAndTranslations(t *testing.T) {
+	const stock = "Types: deb deb-src\nURIs: mirror+file://%s/debian.list\nSuites: trixie trixie-updates trixie-backports\n\n" +
+		"Types: deb deb-src\nURIs: mirror+file://%s/debian-security.list\nSuites: trixie-security\n"
+	for _, mode := range []string{"stock", "custom", "edited-later"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			mirrors := filepath.Join(dir, "mirrors")
+			sourcesDir := filepath.Join(dir, "sources.list.d")
+			conf := filepath.Join(dir, "apt.conf.d")
+			for _, d := range []string{mirrors, sourcesDir, conf} {
+				if err := os.MkdirAll(d, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			os.WriteFile(filepath.Join(mirrors, "debian.list"), []byte("https://deb.debian.org/debian\n"), 0644)
+			os.WriteFile(filepath.Join(mirrors, "debian-security.list"), []byte("https://deb.debian.org/debian-security\n"), 0644)
+			preference := filepath.Join(dir, "preference")
+			os.WriteFile(preference, []byte("official\n"), 0644)
+			sources := filepath.Join(sourcesDir, "debian.sources")
+			content := strings.ReplaceAll(stock, "%s", mirrors)
+			if mode == "custom" {
+				content = "Types: deb deb-src\nURIs: https://custom.invalid/debian\nSuites: trixie\n"
+			}
+			os.WriteFile(sources, []byte(content), 0644)
+			os.WriteFile(filepath.Join(dir, "sudo"), []byte("#!/bin/sh\nexec \"$@\"\n"), 0755)
+			script := strings.ReplaceAll(DebianMirrorsScript, "/etc/apt/mirrors", mirrors)
+			script = strings.ReplaceAll(script, "/etc/apt/sources.list.d", sourcesDir)
+			script = strings.ReplaceAll(script, "/etc/apt/apt.conf.d", conf)
+			script = strings.ReplaceAll(script, "/etc/claude-cage/debian-binary-only", filepath.Join(dir, "binary-only"))
+			script = strings.ReplaceAll(script, "/etc/claude-cage/debian-mirror", preference)
+			osRelease := filepath.Join(dir, "os-release")
+			os.WriteFile(osRelease, []byte("VERSION_CODENAME=trixie\n"), 0644)
+			script = strings.ReplaceAll(script, "/etc/os-release", osRelease)
+			run := func() {
+				t.Helper()
+				cmd := exec.Command("sh", "-c", script)
+				cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%v %s", err, out)
+				}
+			}
+			run()
+			data, _ := os.ReadFile(sources)
+			languages := filepath.Join(conf, "50cage-no-translations")
+			_, confErr := os.Stat(languages)
+			if mode == "custom" {
+				if string(data) != content || confErr == nil {
+					t.Fatalf("changed a custom source list: %q, conf written %v", data, confErr == nil)
+				}
+				return
+			}
+			if strings.Contains(string(data), "deb-src") || strings.Count(string(data), "Types: deb\n") != 2 || !strings.Contains(string(data), "Suites: trixie-security") {
+				t.Fatalf("stock list not trimmed: %q", data)
+			}
+			if conf, err := os.ReadFile(languages); err != nil || !strings.Contains(string(conf), `Acquire::Languages "none";`) {
+				t.Fatalf("translations still on: %q %v", conf, err)
+			}
+			if mode == "edited-later" {
+				// The user turns translations and source indexes back on; a
+				// later maintenance run leaves both alone.
+				os.Remove(languages)
+				restored := strings.ReplaceAll(string(data), "Types: deb\n", "Types: deb deb-src\n")
+				os.WriteFile(sources, []byte(restored), 0644)
+				run()
+				if data, _ := os.ReadFile(sources); string(data) != restored {
+					t.Fatalf("a later run undid the user's source types: %q", data)
+				}
+				if _, err := os.Stat(languages); err == nil {
+					t.Fatal("a later run turned translations off again")
+				}
+			}
+		})
 	}
 }

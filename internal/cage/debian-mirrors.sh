@@ -69,4 +69,18 @@ for repository in debian debian-security; do
   rm -f "$probe"
   trap - EXIT
 done
+# Cage installs binary packages only. Of the image's first index update
+# (28.6 MB), source indexes were 11 MB and translated descriptions 7 MB:
+# minutes through a slow proxy, and again on every later update. Changed
+# once, on the stock list that uses the mirrors above; edits afterwards stay.
+sources=/etc/apt/sources.list.d/debian.sources
+trimmed=/etc/claude-cage/debian-binary-only
+if [ ! -e "$trimmed" ] && [ -f "$sources" ] && grep -q '^URIs: mirror+file:///etc/apt/mirrors/' "$sources"; then
+  sed -i 's/^Types: deb deb-src$/Types: deb/' "$sources"
+  printf '%s\n' '// Cage: skip translated package descriptions; delete this file to restore them.' \
+    'Acquire::Languages "none";' > /etc/apt/apt.conf.d/50cage-no-translations
+  chmod 0644 /etc/apt/apt.conf.d/50cage-no-translations
+  mkdir -p "$(dirname "$trimmed")"
+  : > "$trimmed"
+fi
 CAGE_DEBIAN_MIRRORS
