@@ -1,4 +1,4 @@
-Subject: [PATCH] WHPX: use QEMU interrupt controller emulation for the Cage Linux guest
+Subject: [PATCH] WHPX: keep the in-hypervisor interrupt controller, with fallbacks
 
 ---
 diff --git a/pkg/driver/qemu/qemu.go b/pkg/driver/qemu/qemu.go
@@ -9,7 +9,7 @@ diff --git a/pkg/driver/qemu/qemu.go b/pkg/driver/qemu/qemu.go
  			args = append(args, "-global", "ICH9-LPC.disable_s4=1")
  		default:
 -			args = appendArgsIfNoConflict(args, "-machine", "q35,accel="+accel)
-+			args = appendQ35Machine(args, accel)
++			args = appendQ35Machine(args, accel, cfg.InstanceDir)
  		}
  	case limatype.AARCH64:
  		machine := "virt,accel=" + accel
@@ -17,18 +17,49 @@ diff --git a/pkg/driver/qemu/machine.go b/pkg/driver/qemu/machine.go
 new file mode 100644
 --- /dev/null
 +++ b/pkg/driver/qemu/machine.go
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,46 @@
 +// SPDX-FileCopyrightText: Copyright The Lima Authors
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package qemu
 +
-+func appendQ35Machine(args []string, accel string) []string {
++import (
++	"os"
++	"path/filepath"
++)
++
++const (
++	// WHPXEmulatedIRQChipEnv set to "off" restores QEMU's own interrupt
++	// controller emulation on WHPX for every VM.
++	WHPXEmulatedIRQChipEnv = "CAGE_WHPX_KERNEL_IRQCHIP"
++	// WHPXEmulatedIRQChipFile in an instance directory does the same for that
++	// VM. Cage writes it when the VM could not start with the hypervisor's
++	// interrupt controller.
++	WHPXEmulatedIRQChipFile = "cage-whpx-emulated-irqchip"
++)
++
++// WHPXEmulatedIRQChip reports whether a WHPX VM in instanceDir starts with
++// QEMU's emulated interrupt controller (kernel-irqchip=off).
++func WHPXEmulatedIRQChip(instanceDir string) bool {
++	if os.Getenv(WHPXEmulatedIRQChipEnv) == "off" {
++		return true
++	}
++	if instanceDir == "" {
++		return false
++	}
++	_, err := os.Stat(filepath.Join(instanceDir, WHPXEmulatedIRQChipFile))
++	return err == nil
++}
++
++func appendQ35Machine(args []string, accel, instanceDir string) []string {
 +	machine := "q35,accel=" + accel
-+	if accel == "whpx" {
-+		// QEMU 11 can fail to enable nested virtualization on WHPX even
-+		// when Windows reports it as supported (HRESULT 80370302). Use
-+		// QEMU's interrupt controller emulation for the Cage Linux guest.
++	// QEMU 11 keeps the local APIC in the hypervisor by default: guest timers
++	// and inter-processor interrupts are delivered there. With
++	// kernel-irqchip=off every timer waits for QEMU's host loop instead (a
++	// 1 ms guest sleep measured about 7 ms) and each interrupt exits to QEMU.
++	// It was off because WHPX can refuse nested virtualization (HRESULT
++	// 80370302); Cage's QEMU now continues without it.
++	if accel == "whpx" && WHPXEmulatedIRQChip(instanceDir) {
 +		machine += ",kernel-irqchip=off"
 +	}
 +	return appendArgsIfNoConflict(args, "-machine", machine)
@@ -37,27 +68,47 @@ diff --git a/pkg/driver/qemu/machine_test.go b/pkg/driver/qemu/machine_test.go
 new file mode 100644
 --- /dev/null
 +++ b/pkg/driver/qemu/machine_test.go
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,44 @@
 +// SPDX-FileCopyrightText: Copyright The Lima Authors
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package qemu
 +
-+import "testing"
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
 +
 +func TestWHPXMachineCompatibility(t *testing.T) {
-+	for _, accel := range []string{"whpx", "kvm", "hvf", "nvmm"} {
-+		want := "q35,accel=" + accel
-+		if accel == "whpx" {
-+			want += ",kernel-irqchip=off"
-+		}
-+		args := appendQ35Machine(nil, accel)
-+		if got, _ := argValue(args, "-machine"); got != want {
-+			t.Fatalf("%s: got %q, want %q", accel, got, want)
++	fallback := t.TempDir()
++	if err := os.WriteFile(filepath.Join(fallback, WHPXEmulatedIRQChipFile), []byte("0.2.1\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct {
++		name, env, dir string
++		emulated       bool
++	}{
++		{name: "default", dir: t.TempDir()},
++		{name: "no instance directory"},
++		{name: "explicitly on", env: "on", dir: t.TempDir()},
++		{name: "setting off", env: "off", dir: t.TempDir(), emulated: true},
++		{name: "instance fell back", dir: fallback, emulated: true},
++	} {
++		t.Setenv(WHPXEmulatedIRQChipEnv, tc.env)
++		for _, accel := range []string{"whpx", "kvm", "hvf", "nvmm"} {
++			want := "q35,accel=" + accel
++			if accel == "whpx" && tc.emulated {
++				want += ",kernel-irqchip=off"
++			}
++			args := appendQ35Machine(nil, accel, tc.dir)
++			if got, _ := argValue(args, "-machine"); got != want {
++				t.Fatalf("%s, %s: got %q, want %q", tc.name, accel, got, want)
++			}
 +		}
 +	}
 +	// Retain Lima's explicit override contract for custom QEMU arguments.
-+	args := appendQ35Machine([]string{"-machine", "q35,accel=whpx,kernel-irqchip=on"}, "whpx")
++	args := appendQ35Machine([]string{"-machine", "q35,accel=whpx,kernel-irqchip=on"}, "whpx", fallback)
 +	if len(args) != 2 || args[1] != "q35,accel=whpx,kernel-irqchip=on" {
 +		t.Fatalf("overrode explicit machine: %v", args)
 +	}

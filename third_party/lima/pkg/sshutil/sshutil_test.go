@@ -222,3 +222,11 @@ func Test_DisableControlMasterOptsFromSSHArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestPreferAESCiphers(t *testing.T) {
+	assert.Equal(t, preferAESCiphers(true, "darwin"), true)
+	assert.Equal(t, preferAESCiphers(true, "linux"), true)
+	assert.Equal(t, preferAESCiphers(false, "linux"), false)
+	// The WHPX guest lacks AES-NI even when the host has it.
+	assert.Equal(t, preferAESCiphers(true, "windows"), false)
+}

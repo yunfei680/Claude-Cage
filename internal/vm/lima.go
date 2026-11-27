@@ -793,13 +793,6 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 		}
 	}
 	return withLog(quietBootLog{log}, func() error {
-		if err := reconcile.Reconcile(ctx, name); err != nil {
-			return err
-		}
-		// Lima writes cloud-config.yaml with 0o444 (Windows DOS ReadOnly); make it
-		// writable before hostagent regenerates it on restart.
-		_ = host.MakeTreeWritable(filepath.Join(inst.Dir, filenames.CloudConfig))
-		started := time.Now()
 		progress := firstBoot(ctx)
 		if progress {
 			// A first boot installs packages through the selected proxy and
@@ -808,7 +801,21 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 			ctx = instance.WithWatchHostAgentTimeout(ctx, FirstBootMaxWait)
 			ctx = instance.WithWatchHostAgentIdleTimeout(ctx, FirstBootIdleWait)
 		}
-		return vmStartError(instance.StartWithPaths(ctx, inst, false, progress, "", guestAgent), inst.Dir, started)
+		start := func(ctx context.Context) error {
+			if err := reconcile.Reconcile(ctx, name); err != nil {
+				return err
+			}
+			// Lima writes cloud-config.yaml with 0o444 (Windows DOS ReadOnly); make it
+			// writable before hostagent regenerates it on restart.
+			_ = host.MakeTreeWritable(filepath.Join(inst.Dir, filenames.CloudConfig))
+			started := time.Now()
+			return vmStartError(instance.StartWithPaths(ctx, inst, false, progress, "", guestAgent), inst.Dir, started)
+		}
+		// A failed start can leave the hostagent and QEMU running.
+		stop := func(ctx context.Context) error {
+			return errors.Join(stopInstance(ctx, inst), reconcile.Reconcile(ctx, ""))
+		}
+		return startWithIRQChipFallback(ctx, inst, log, start, stop)
 	})
 }
 
