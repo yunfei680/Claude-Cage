@@ -1,0 +1,159 @@
+name: Patched build of new Cage releases
+# Once a day, look for a new release of Lee-xeo/Claude-Cage. When there is
+# one, apply this fork's changes (branch smooth, minus .github) to it, build
+# and test the unsigned Windows installer with Cage's own build scripts, and
+# open an issue here saying where to download it or what went wrong.
+# Nothing is pushed and no secrets are used.
+on:
+  schedule:
+    - cron: '23 1 * * *' # 09:23 in China
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream release tag (default: the latest release)'
+        required: false
+        type: string
+      force:
+        description: Build again although an issue for this tag exists
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: patched-release-build
+  cancel-in-progress: false
+env:
+  UPSTREAM: Lee-xeo/Claude-Cage
+  PATCH_BRANCH: smooth
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      build: ${{ steps.release.outputs.build }}
+      base: ${{ steps.apply.outputs.base }}
+      sha: ${{ steps.apply.outputs.sha }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          tag="${WANTED:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
+          case "$tag" in v[0-9]*) ;; *) echo "::error::unexpected release tag '$tag'"; exit 1;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          seen=$(gh issue list -R "$GITHUB_REPOSITORY" --state all --limit 500 --json title \
+            --jq "[.[] | select(.title | startswith(\"补丁版 Cage $tag：\"))] | length")
+          if [ "$seen" != 0 ] && [ "$FORCE" != true ]; then
+            echo "Already reported $tag."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: apply
+        if: steps.release.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git init --quiet src
+          cd src
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git remote add fork "https://github.com/$GITHUB_REPOSITORY.git"
+          # Both remotes supply file contents on demand.
+          for remote in origin fork; do
+            git config "remote.$remote.promisor" true
+            git config "remote.$remote.partialclonefilter" blob:none
+          done
+          git fetch --quiet --filter=blob:none --tags origin
+          git fetch --quiet --filter=blob:none fork "$PATCH_BRANCH:refs/remotes/fork/patches"
+          # The fork branch starts from an upstream release; its changes are
+          # everything after that tag.
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' fork/patches)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          git checkout --quiet --detach "$TAG"
+          git diff --binary "$base" fork/patches -- . ':(exclude).github' > ../changes.patch
+          git apply --3way --index ../changes.patch
+          git -c user.name='Cage patched build' -c user.email='actions@users.noreply.github.com' \
+            commit --quiet -m "This fork's changes ($base..$PATCH_BRANCH) on $TAG"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git bundle create ../changes.bundle "$TAG..HEAD"
+      - if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-source
+          path: changes.bundle
+          retention-days: 7
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: patched-source
+          path: ${{ runner.temp }}/patched-source
+      - name: Check out the patched commit
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          git fetch --quiet "$env:RUNNER_TEMP/patched-source/changes.bundle" "HEAD:refs/heads/patched"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git checkout --quiet --force patched
+          if ((git rev-parse HEAD).Trim() -ne $env:SHA) { throw 'The bundle holds a different commit.' }
+      - uses: ./.github/actions/windows-toolchain
+        with:
+          corresponding-sources: false
+      - name: Build, test and install the unsigned package
+        env:
+          CAGE_BUILD_REF: ${{ needs.prepare.outputs.sha }}
+        run: ./scripts/ci-windows-build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cage-windows-${{ needs.prepare.outputs.tag }}-patched
+          path: _output/releases/*/windows/*
+          if-no-files-found: error
+          retention-days: 90
+
+  report:
+    needs: [prepare, build]
+    if: always() && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          PREPARED: ${{ needs.prepare.result }}
+          BUILT: ${{ needs.build.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$BUILT" = success ]; then
+            title="补丁版 Cage $TAG：安装包已生成"
+            body="官方发布了 $TAG。本仓库 $PATCH_BRANCH 分支的修改（剪贴板修复、流畅度优化等）已合到这个版本上，编译和自动测试都通过了。
+
+          下载：打开 $RUN ，在页面底部 Artifacts 下载 \`cage-windows-$TAG-patched\`（90 天内有效），解压得到安装包。
+          安装：先保存工作，从托盘“退出 Cage”并停止环境，再运行安装包，安装位置保持原目录。"
+          elif [ "$PREPARED" != success ]; then
+            title="补丁版 Cage $TAG：修改合不上新版本"
+            body="官方发布了 $TAG，但本仓库 $PATCH_BRANCH 分支的修改（基于 $BASE）和新版本有冲突，没有生成安装包。需要把修改更新到 $TAG 后再编译。详情：$RUN"
+          else
+            title="补丁版 Cage $TAG：编译或测试失败"
+            body="官方发布了 $TAG，修改已合上，但编译或自动测试没有通过，没有生成安装包。详情：$RUN"
+          fi
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
