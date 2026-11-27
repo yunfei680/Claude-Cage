@@ -148,7 +148,7 @@ jobs:
             body="官方发布了 $TAG。本仓库 $PATCH_BRANCH 分支的修改（剪贴板修复、流畅度优化等）已合到这个版本上，编译和自动测试都通过了。
 
           下载：打开 $RUN ，在页面底部 Artifacts 下载 \`cage-windows-$TAG-patched\`（90 天内有效），解压得到安装包。
-          安装：先保存工作，从托盘“退出 Cage”并停止环境，再运行安装包，安装位置保持原目录。"
+          安装：先保存工作，从托盘「退出 Cage」并停止环境，再运行安装包，安装位置保持原目录。"
           elif [ "$PREPARED" != success ]; then
             title="补丁版 Cage $TAG：修改合不上新版本"
             body="官方发布了 $TAG，但本仓库 $PATCH_BRANCH 分支的修改（基于 $BASE）和新版本有冲突，没有生成安装包。需要把修改更新到 $TAG 后再编译。详情：$RUN"
