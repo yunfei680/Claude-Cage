@@ -4,7 +4,9 @@
 Chromium and Electron render in software here, and take their frame interval
 from the display's RandR refresh rate. Rendering, capture, encoding, transport
 and host decoding therefore all scale with that one number. Input restores the
-full rate within a few frames; an unattended animation runs at a lower one.
+full rate within a few frames. Output that keeps changing after the last
+input, such as a streamed reply, keeps the full rate for a few minutes; an
+unattended animation then runs at a lower one.
 """
 import os
 import select
@@ -15,7 +17,9 @@ import sys
 import time
 
 ACTIVE_RATE = 60
-PASSIVE_RATE = 30
+# Reading a reply as it streams in is passive use too: 30 Hz made scrolling
+# text visibly step. The guest has the headroom since WHPX keeps its APIC.
+PASSIVE_RATE = 60
 IDLE_RATE = 20
 ACTIVE_HOLD = 3.0
 IDLE_AFTER = 180.0

@@ -37,9 +37,15 @@ class PolicyTests(unittest.TestCase):
     def test_rate_follows_time_since_input(self):
         self.assertEqual(governor.target_rate(0), 60)
         self.assertEqual(governor.target_rate(2.9), 60)
-        self.assertEqual(governor.target_rate(3), 30)
-        self.assertEqual(governor.target_rate(179), 30)
+        self.assertEqual(governor.target_rate(3), 60)
+        self.assertEqual(governor.target_rate(179), 60)
         self.assertEqual(governor.target_rate(180), 20)
+
+    def test_a_lower_passive_rate_still_applies(self):
+        with mock.patch.object(governor, 'PASSIVE_RATE', 30):
+            self.assertEqual(governor.target_rate(2.9), 60)
+            self.assertEqual(governor.target_rate(3), 30)
+            self.assertEqual(governor.target_rate(180), 20)
 
     def test_wakes_exactly_at_the_next_change(self):
         self.assertAlmostEqual(governor.next_change(1), 2)
@@ -226,7 +232,7 @@ class DisplayTests(unittest.TestCase):
         script = (f'import importlib.util, sys\n'
                   f'spec = importlib.util.spec_from_file_location("g", {str(Path(__file__).with_name("display-governor.py"))!r})\n'
                   f'g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)\n'
-                  f'g.ACTIVE_HOLD, g.IDLE_AFTER = .5, 1.5\nsys.exit(g.main())\n')
+                  f'g.ACTIVE_HOLD, g.IDLE_AFTER, g.PASSIVE_RATE = .5, 1.5, 30\nsys.exit(g.main())\n')
         process = subprocess.Popen([sys.executable, '-c', script], env=self.env)
         self.addCleanup(stop_process, process)
         self.process = process
